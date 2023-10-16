@@ -1,0 +1,152 @@
+name: kafka-to-clickhouse
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  KAFKA_PACKAGE: "org.apache.spark:spark-sql-kafka-0-10_2.12:3.1.1"
+  CLICKHOUSE_PACKAGE: "com.github.housepower:clickhouse-native-jdbc-shaded:2.6.5"
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.9', '3.10']
+
+    services:
+      kafka:
+        image: confluentinc/cp-kafka:7.3.1
+        ports:
+          - 29092:29092
+        env:
+          KAFKA_BROKER_ID: 1
+          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+        options: >-
+          --health-cmd "nc -z localhost 9092 || exit -1"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 10
+      clickhouse:
+        image: clickhouse/clickhouse-server:22.12
+        ports:
+          - 8123:8123
+          - 9000:9000
+        options: >-
+          --health-cmd "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 10
+      zookeeper:
+        image: zookeeper:3.8
+        options: >-
+          --health-cmd "nc -z localhost 2181 || exit -1"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 10
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: 8
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r backend/fastapi_consumer/requirements.txt --no-cache-dir
+          pip install -r backend/pyspark_producer/requirements.txt --no-cache-dir
+      - name: Lint with flake8
+        run: |
+          pip install wemake-python-styleguide flake8-html
+          flake8 backend --format=html --htmldir=flake8/
+      - name: Lint with mypy
+        run: |
+          pip install mypy lxml 
+          mypy backend --html-report=mypy/
+      - name: Run API
+        run: |
+          cd backend/fastapi_consumer/src
+          nohup python main.py &
+      - name: Stop API
+        run: |
+          kill $(ps aux | grep python | grep main.py | awk '{print $2}')
+      - name: Run ETL
+        run: |
+          cd backend/pyspark_producer/src
+          nohup python main.py &
+        env:
+          PYSPARK_PYTHON: "${{env.Python3_ROOT_DIR}}"
+          PYSPARK_DRIVER_PYTHON: "${{env.Python3_ROOT_DIR}}"
+          PYSPARK_SUBMIT_ARGS: "--packages ${{env.KAFKA_PACKAGE}},${{env.CLICKHOUSE_PACKAGE}} pyspark-shell"
+      - name: Stop ETL
+        run: |
+          kill $(ps aux | grep python | grep main.py | awk '{print $2}')
+      - name: Output results
+        uses: actions/upload-artifact@v3
+        with:
+          name: Report
+          path: |
+            flake8/
+            mypy/
+
+  docker:
+    name: Docker
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Login to Docker
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Push Backend (FastAPI Consumer) to Docker Hub
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          context: backend/fastapi_consumer
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/event_sourcing:${{ vars.TAG }}
+            ${{ secrets.DOCKER_USERNAME }}/event_sourcing:latest
+      - name: Push Backend (PySpark Producer) to Docker Hub
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          context: backend/pyspark_producer
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/kafka_to_clickhouse:${{ vars.TAG }}
+            ${{ secrets.DOCKER_USERNAME }}/kafka_to_clickhouse:latest
+
+  send_message:
+    name: Send message
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+      - name: Send message
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            В репозитории ${{ github.repository }} выполнен коммит:
+            Автор: ${{ github.event.commits[0].author.name }}
+            Сообщение: ${{ github.event.commits[0].message }}
+            Ссылка: https://github.com/${{ github.repository }}/commit/${{github.sha}}

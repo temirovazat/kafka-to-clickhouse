@@ -1,0 +1,89 @@
+x-kafka-env: &kafka-env
+  KAFKA_HOST: kafka
+  KAFKA_PORT: 9092
+
+x-clickhouse-env: &clickhouse-env
+  CLICKHOUSE_HOST: clickhouse-node1
+  CLICKHOUSE_PORT: 9000
+
+services:
+  fastapi:
+    build: ../../backend/fastapi_consumer
+    ports:
+      - 8000:8000
+    entrypoint: >
+      sh -c "python main.py"
+    environment:
+      FASTAPI_DEBUG: True
+      <<: *kafka-env
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  pyspark:
+    build: ../../backend/pyspark_producer
+    restart: always
+    environment:
+      CLICKHOUSE_HTTP_PORT: 8123
+      <<: [*kafka-env, *clickhouse-env]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      clickhouse-node1:
+        condition: service_healthy
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.1
+    ports:
+      - 29092:29092
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+    healthcheck:
+      test: nc -z localhost 9092 || exit -1
+      interval: 5s
+      timeout: 5s
+      retries: 100
+
+  clickhouse-node1:
+    image: clickhouse/clickhouse-server:22.12
+    ports:
+      - 8123:8123
+      - 9000:9000
+    volumes:
+      - ../data/node1:/etc/clickhouse-server
+      - ../data/shard1.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 100
+    depends_on:
+      - zookeeper
+  clickhouse-node2:
+    image: clickhouse/clickhouse-server:22.12
+    volumes:
+      - ../data/node2:/etc/clickhouse-server
+    depends_on:
+      - zookeeper
+  clickhouse-node3:
+    image: clickhouse/clickhouse-server:22.12
+    volumes:
+      - ../data/node3:/etc/clickhouse-server
+      - ../data/shard2.sql:/docker-entrypoint-initdb.d/init.sql
+    depends_on:
+      - zookeeper
+  clickhouse-node4:
+    image: clickhouse/clickhouse-server:22.12
+    volumes:
+      - ../data/node4:/etc/clickhouse-server
+    depends_on:
+      - zookeeper
+
+  zookeeper:
+    image: zookeeper:3.8

@@ -1,0 +1,3 @@
+clickhouse-driver==0.2.6
+vertica_python==1.3.2
+Faker==18.10.1
